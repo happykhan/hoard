@@ -10,6 +10,7 @@ import shutil
 
 s3_conn = None 
 BUCKET_NAME = 'quadram-bioinfo-allthebacteria'
+MAX_WORKERS = 10 
 
 # --- S3 functions ---
 def get_or_create_s3_conn(): 
@@ -92,29 +93,73 @@ def split_path(filename):
     # Construct the new path
     new_path = os.path.join(part1, part2, filename)
     return new_path, os.path.join(part1, part2)
+import subprocess
+
+def compress_with_pigz(input_file, output_file):
+    """
+    Compress a file using pigz.
+
+    :param input_file: Path to the input file
+    :param output_file: Path where the compressed file should be saved
+    """
+    threads = str(max(os.cpu_count() - 1, 1))
+    subprocess.run(['pigz', '-p', threads , '-c', input_file], stdout=open(output_file, 'wb'))
+    print('Compressed ' , output_file)
+
+import threading
+import queue
+
+class Worker(threading.Thread):
+    def __init__(self, q, *args, **kwargs):
+        self.q = q
+        super().__init__(*args, **kwargs)
+        dotenv_path = '.keys.env' 
+        load_dotenv(dotenv_path=dotenv_path)    
+        # Create a resource using your S3 credentials
+        self.s3_conn = boto3.resource('s3', endpoint_url = 'https://s3.climb.ac.uk', aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID"), aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"))
+
+    def run(self):
+        while True:
+            try:
+                work = self.q.get() 
+            except queue.Empty:
+                return
+            self.upload_file_to_s3(work[0], work[1], prefix=work[2])
+            self.q.task_done()
+
+    def upload_file_to_s3(self, file_path, bucket, prefix='hoard'):
+        file_name = os.path.basename(file_path)
+        object = self.s3_conn.Object(bucket, prefix + '/' + file_name)
+        object.put(Body=open(file_path, 'rb'))
+        print('thread uploaded', file_name)
 
 
+            
 def main():
-    existing = get_existing_files()
+    existing = get_existing_files() 
+    q = queue.Queue()
+    for _ in range(MAX_WORKERS):
+        print('Starting worker', _ )
+        Worker(q).start()
 
     for archive in create_archive_list():
         archive_path = get_ftp_file(archive)
         if os.path.exists(archive_path) and os.path.getsize(archive_path) > 100: 
-            output_fasta_dir = extract_xz(archive_path, 'temp/')
-            for fasta_path in [os.path.join(output_fasta_dir, x) for x in os.listdir(output_fasta_dir) if x.endswith('.fa')]:
-                gz_fasta_path = fasta_path + '.gz'
-                gz_fasta_name = os.path.basename(gz_fasta_path)
+            output_fasta_dir = os.path.join('temp', os.path.basename(archive_path).split('.')[0]) 
+            if not os.path.exists(output_fasta_dir):
+                output_fasta_dir = extract_xz(archive_path, 'temp/') 
+            # Compress all remaining fasta files. 
+            file_paths  = {os.path.join(output_fasta_dir, x + '.gz'): os.path.join(output_fasta_dir, x) for x in os.listdir(output_fasta_dir) if x.endswith('.fa')  }
+            for gz_fasta_path, fasta_path in  file_paths.items():
                 if not os.path.exists(gz_fasta_path):
-                    with open(fasta_path, 'rb') as f_in:
-                        with gzip.open(gz_fasta_path, 'wb') as f_out:
-                            shutil.copyfileobj(f_in, f_out)          
+                    compress_with_pigz(fasta_path, gz_fasta_path)
+                gz_fasta_name = os.path.basename(gz_fasta_path) 
                 s3_full_path, s3_dirs = split_path(gz_fasta_name)      
                 if not os.path.join('hoard', s3_full_path) in existing:
-                    upload_file_to_s3(gz_fasta_path, BUCKET_NAME, prefix= os.path.join('hoard', s3_dirs)) 
-                    print('uploading', gz_fasta_name)
+                    # upload_file_to_s3(gz_fasta_path, BUCKET_NAME, prefix= os.path.join('hoard', s3_dirs)) 
+                    q.put([gz_fasta_path, BUCKET_NAME, os.path.join('hoard', s3_dirs)])
                 else:
-                    print('file found, skipping',  s3_full_path)
-            os.rmdir(output_fasta_dir)
+                    print('Skipping ', gz_fasta_name )
 
-
+    q.join()  # blocks until the queue is empty.
 main() 
