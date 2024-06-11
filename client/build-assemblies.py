@@ -7,36 +7,66 @@ import lzma
 import tarfile 
 import gzip
 import shutil
+import subprocess
+import threading
+import queue
 
 s3_conn = None 
 BUCKET_NAME = 'quadram-bioinfo-allthebacteria'
 MAX_WORKERS = 10 
 
 # --- S3 functions ---
+
 def get_or_create_s3_conn(): 
+    """
+    Get or create an S3 connection using the AWS credentials from the .keys.env file.
+
+    :return: S3 connection object
+    """
     global s3_conn
     dotenv_path = '.keys.env' 
     load_dotenv(dotenv_path=dotenv_path)    
     if s3_conn:
         return s3_conn
     # Create a resource using your S3 credentials
-    s3 = boto3.resource('s3', endpoint_url = 'https://s3.climb.ac.uk', aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID"), aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"))
+    s3 = boto3.resource('s3', endpoint_url='https://s3.climb.ac.uk', aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"))
     s3_conn = s3 
     return s3_conn
 
 def upload_file_to_s3(file_path, bucket, prefix='hoard'):
+    """
+    Upload a file to S3.
+
+    :param file_path: Path to the file to be uploaded
+    :param bucket: S3 bucket name
+    :param prefix: Prefix for the S3 object key
+    """
     file_name = os.path.basename(file_path)
     s3 = get_or_create_s3_conn()
     object = s3.Object(bucket, prefix + '/' + file_name)
     object.put(Body=open(file_path, 'rb'))
 
 def download_file_from_s3(key, bucket, output_path, prefix='hoard'):
+    """
+    Download a file from S3.
+
+    :param key: S3 object key
+    :param bucket: S3 bucket name
+    :param output_path: Path to save the downloaded file
+    :param prefix: Prefix for the S3 object key
+    """
     s3 = get_or_create_s3_conn()
     object = s3.Object(bucket, prefix + '/' + key)
     with open(output_path, 'w') as f:
          f.write(object.get()['Body'].read().decode('utf-8'))
 
 def get_existing_files(directory='hoard/'):
+    """
+    Get a list of existing files in the specified S3 directory.
+
+    :param directory: S3 directory path
+    :return: List of existing file paths
+    """
     s3 = get_or_create_s3_conn()
     my_bucket = s3.Bucket(BUCKET_NAME)    
     existing_files = [] 
@@ -46,13 +76,29 @@ def get_existing_files(directory='hoard/'):
 
 # --- FTP functions ---
 
-def create_archive_list(species='escherichia_coli', max=75, ftp_dir = 'pub/databases/AllTheBacteria/Releases/0.2/assembly/'):
+def create_archive_list(species='escherichia_coli', max=75, ftp_dir='pub/databases/AllTheBacteria/Releases/0.2/assembly/'):
+    """
+    Create a list of archive file paths for a given species.
+
+    :param species: Species name
+    :param max: Maximum number of archives to include
+    :param ftp_dir: FTP directory path
+    :return: List of archive file paths
+    """
     all_archives = [] 
     for i in range(max):
         all_archives.append(os.path.join(ftp_dir, species + '__' + str(i).zfill(2) + '.asm.tar.xz'))
     return all_archives
 
-def get_ftp_file(ftp_path, ftp_server = 'ftp.ebi.ac.uk', local_dir='temp'):
+def get_ftp_file(ftp_path, ftp_server='ftp.ebi.ac.uk', local_dir='temp'):
+    """
+    Download a file from an FTP server.
+
+    :param ftp_path: FTP file path
+    :param ftp_server: FTP server address
+    :param local_dir: Local directory to save the downloaded file
+    :return: Path to the downloaded file
+    """
     if not os.path.exists(local_dir):
         os.mkdir(local_dir)
     local_filename = os.path.join(local_dir, os.path.basename(ftp_path))
@@ -75,6 +121,7 @@ def extract_xz(file_path, output_dir):
 
     :param file_path: Path to the .xz file
     :param output_path: Path to save the extracted file
+    :return: Path to the extracted file
     """
     with lzma.open(file_path, 'rb') as xz_file:
         with tarfile.open(fileobj=xz_file) as tar:
@@ -83,6 +130,12 @@ def extract_xz(file_path, output_dir):
     return os.path.join(output_dir, os.path.basename(file_path).split('.')[0]) 
 
 def split_path(filename):
+    """
+    Split a file path into parts.
+
+    :param filename: File path
+    :return: Tuple containing the new path and directory path
+    """
     # Remove the extension to get the base name
     base_name = os.path.splitext(os.path.splitext(filename)[0])[0]
     
@@ -93,7 +146,7 @@ def split_path(filename):
     # Construct the new path
     new_path = os.path.join(part1, part2, filename)
     return new_path, os.path.join(part1, part2)
-import subprocess
+
 
 def compress_with_pigz(input_file, output_file):
     """
@@ -106,8 +159,6 @@ def compress_with_pigz(input_file, output_file):
     subprocess.run(['pigz', '-p', threads , '-c', input_file], stdout=open(output_file, 'wb'))
     print('Compressed ' , output_file)
 
-import threading
-import queue
 
 class Worker(threading.Thread):
     def __init__(self, q, *args, **kwargs):
@@ -116,7 +167,7 @@ class Worker(threading.Thread):
         dotenv_path = '.keys.env' 
         load_dotenv(dotenv_path=dotenv_path)    
         # Create a resource using your S3 credentials
-        self.s3_conn = boto3.resource('s3', endpoint_url = 'https://s3.climb.ac.uk', aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID"), aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"))
+        self.s3_conn = boto3.resource('s3', endpoint_url='https://s3.climb.ac.uk', aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"))
 
     def run(self):
         while True:
@@ -128,13 +179,18 @@ class Worker(threading.Thread):
             self.q.task_done()
 
     def upload_file_to_s3(self, file_path, bucket, prefix='hoard'):
+        """
+        Upload a file to S3.
+
+        :param file_path: Path to the file to be uploaded
+        :param bucket: S3 bucket name
+        :param prefix: Prefix for the S3 object key
+        """
         file_name = os.path.basename(file_path)
         object = self.s3_conn.Object(bucket, prefix + '/' + file_name)
         object.put(Body=open(file_path, 'rb'))
         print('thread uploaded', file_name)
 
-
-            
 def main():
     existing = get_existing_files() 
     q = queue.Queue()
@@ -162,4 +218,5 @@ def main():
                     print('Skipping ', gz_fasta_name )
 
     q.join()  # blocks until the queue is empty.
+
 main() 
