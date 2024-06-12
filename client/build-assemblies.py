@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import queue
+import csv
 
 s3_conn = None 
 BUCKET_NAME = 'quadram-bioinfo-allthebacteria'
@@ -192,30 +193,66 @@ class Worker(threading.Thread):
         print('thread uploaded', file_name)
 
 def main():
+    print('Reading existing files...')
     existing = get_existing_files() 
+    print('Existing files read.')
     q = queue.Queue()
     for _ in range(MAX_WORKERS):
         print('Starting worker', _ )
         Worker(q).start()
-
+    metadata_dir = 'metadata'
+    all_accession_path = os.path.join(metadata_dir, 'all_accessions.tsv')
+    # Read the all_accession.tsv file as a dictionary
+    accession_dict = {}
+    with open(all_accession_path, 'r') as file:
+        reader = csv.DictReader(file, delimiter='\t')
+        for row in reader:
+            accession_dict[row['biosample']] = row
     for archive in create_archive_list():
         archive_path = get_ftp_file(archive)
         if os.path.exists(archive_path) and os.path.getsize(archive_path) > 100: 
-            output_fasta_dir = os.path.join('temp', os.path.basename(archive_path).split('.')[0]) 
-            if not os.path.exists(output_fasta_dir):
-                output_fasta_dir = extract_xz(archive_path, 'temp/') 
-            # Compress all remaining fasta files. 
-            file_paths  = {os.path.join(output_fasta_dir, x + '.gz'): os.path.join(output_fasta_dir, x) for x in os.listdir(output_fasta_dir) if x.endswith('.fa')  }
-            for gz_fasta_path, fasta_path in  file_paths.items():
-                if not os.path.exists(gz_fasta_path):
-                    compress_with_pigz(fasta_path, gz_fasta_path)
-                gz_fasta_name = os.path.basename(gz_fasta_path) 
-                s3_full_path, s3_dirs = split_path(gz_fasta_name)      
-                if not os.path.join('hoard', s3_full_path) in existing:
-                    # upload_file_to_s3(gz_fasta_path, BUCKET_NAME, prefix= os.path.join('hoard', s3_dirs)) 
-                    q.put([gz_fasta_path, BUCKET_NAME, os.path.join('hoard', s3_dirs)])
-                else:
-                    print('Skipping ', gz_fasta_name )
+            missing_from_this_tar = [] 
+            with tarfile.open(archive_path, 'r:xz') as tar:
+                for member in tar.getmembers():
+                    hoard_path = 'hoard/' + split_path(os.path.basename(member.name))[0] + '.gz' 
+                    if not hoard_path in existing:
+                       missing_from_this_tar.append(member.name)
+                    else:
+                        if accession_dict.get(os.path.basename(member.name.split('.')[0])):
+                            accession_dict[os.path.basename(member.name.split('.')[0])]['url'] = 'https://quadram-bioinfo-allthebacteria.s3.climb.ac.uk/' + hoard_path
+            if missing_from_this_tar:
+                print(f'Missing {len(missing_from_this_tar)} files: ')
+                output_fasta_dir = os.path.join('temp', os.path.basename(archive_path).split('.')[0]) 
+                if not os.path.exists(output_fasta_dir):
+                    output_fasta_dir = extract_xz(archive_path, 'temp/') 
+                # Compress all remaining fasta files. 
+
+                file_paths  = {os.path.join(output_fasta_dir, x + '.gz'): os.path.join(output_fasta_dir, x) for x in os.listdir(output_fasta_dir) if x.endswith('.fa') and x in missing_from_this_tar }
+                for gz_fasta_path, fasta_path in  file_paths.items():
+                    if not os.path.exists(gz_fasta_path):
+                        compress_with_pigz(fasta_path, gz_fasta_path)
+                    gz_fasta_name = os.path.basename(gz_fasta_path) 
+                    s3_full_path, s3_dirs = split_path(gz_fasta_name)      
+                    url = 'https://quadram-bioinfo-allthebacteria.s3.climb.ac.uk/' + os.path.join('hoard', s3_full_path) 
+                    if accession_dict.get(os.path.basename(gz_fasta_name.split('.')[0])):
+                        accession_dict[os.path.basename(gz_fasta_name.split('.')[0])]['url'] = url
+                    if not os.path.join('hoard', s3_full_path) in existing:
+                        q.put([gz_fasta_path, BUCKET_NAME, os.path.join('hoard', s3_dirs)])
+                    else:
+                        print('Skipping ', gz_fasta_name )
+            else:
+                print('All files accounted for. Skipping ', archive_path)
+                # delete archive_path file
+                os.remove(archive_path)          
+        # write accession_dict to new  file              
+        outout = os.path.join(metadata_dir, 'all_url_accessions.tsv')    
+        with open(outout, 'w') as file:
+            fieldnames = ['biosample', 'acc', 'experiment', 'sample_name', 'sample_acc', 'bioproject', 'sra_study', 'url']
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in accession_dict.values():
+                if row.get('url'):
+                    writer.writerow(row)
 
     q.join()  # blocks until the queue is empty.
 
